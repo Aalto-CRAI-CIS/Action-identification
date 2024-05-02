@@ -1,0 +1,419 @@
+#This is a script for training a SetFit based classifier for identifying actions in social media comments. For information on the original SetFit publication, see Tunstall, L., Reimers, N., Jo, U. E. S., Bates, L., Korat, D., Wasserblat, M., & Pereg, O. (2022). Efficient few-shot learning without prompts. arXiv preprint arXiv:2209.11055.
+ 
+
+#install necessary libraries
+#!python -m pip install --user setfit --upgrade
+#!python -m pip install --user setfit[optuna]
+#!python -m pip install --user optuna --upgrade
+#!python -m pip install --user wandb --upgrade --use-feature=2020-resolver
+#!python -m pip install --user huggingface_hub
+
+#! python -m pip freeze
+
+#! git lfs install
+
+#!pip install wandb
+import wandb
+wandb.login()
+
+#Import libraries
+
+import pandas as pd
+import numpy as np
+import math
+
+import setfit
+from setfit import SetFitModel, SetFitTrainer
+from sentence_transformers.losses import CosineSimilarityLoss, ContrastiveLoss, SoftmaxLoss, TripletLoss
+
+from sklearn.metrics import f1_score, balanced_accuracy_score, accuracy_score
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import confusion_matrix, multilabel_confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statistics import mean
+import numpy as np
+
+
+
+def get_multi_label_labels(row):
+    row_labels = []
+    row_labels.append(row['primary tag'])
+    if str(row['secondary tag']) != 'nan':
+        row_labels.append(row['secondary tag'])
+    if str(row['tertiary']) != 'nan':
+        row_labels.append(row['tertiary'])
+    return row_labels
+
+def create_multi_label_dataset(data):
+    new_data = []
+    for i, row in data.iterrows():
+        new_row = dict()
+        new_row['text'] = row['Text']
+        labels = get_multi_label_labels(row)
+        for j in classes:
+            if j in labels:
+                new_row[j] = 1
+            else:
+                new_row[j] = 0
+        new_data.append(new_row)
+    return pd.DataFrame(new_data)
+ 
+from math import log2
+ 
+# calculate cross entropy
+def cross_entropy(p, q):
+ return -sum([p[i]*log2(q[i]) for i in range(len(p))])
+
+
+
+def get_data(data, action_n,threshold):
+    #labels1 = data[str(str(action_n)+'1')]
+    labels2 =data[str(str(action_n)+'2')]
+    #labels3 =data[str(str(action_n)+'3')]
+    texts = data['message_x']
+
+    test_scores=[]
+
+    labels= []
+    i =0
+    for item in labels2:
+        if item == 'nan':
+            labels.append(0)
+        else:
+            if item >threshold:
+                labels.append(1)
+            else:
+                labels.append(0)
+        score= float(item)
+        test_scores.append(float(score))
+        i +=1
+    return pd.Series(texts), pd.Series(labels), test_scores
+
+
+        
+def get_scores_for_testset(y_test, scores):
+    labs=y_test
+    print(labs)
+    indxs= labs.index.tolist()
+    print("indexes ytest:", indxs)
+    
+    test_scores=[]
+    for item in indxs:
+        newscore= scores[int(item)]
+        test_scores.append(newscore)
+    return test_scores
+
+from sklearn.model_selection import train_test_split    # Import train_test_split function
+
+def get_data_splits(state_x, texts, labels, data, action_n, threshold, scores):
+    
+    texts, labels, test_scores= get_data(data, action_n,threshold)
+    X_train, X_test, y_train, y_test = train_test_split(texts, labels, test_size=0.2, random_state=state_x)
+    X_test, X_val, y_test, y_val = train_test_split(X_test, y_test, test_size=0.5, random_state=state_x)
+    indxs=y_test.index.tolist()
+    print(test_scores)
+    print(len(X_train))
+    y_train = y_train.values.tolist()
+    y_test = y_test.values.tolist()
+    y_val = y_val.values.tolist()
+    
+    X_tr=[]
+    y_train_n=[]
+    i =0
+    for item in X_train:
+        new = str(item)
+        X_tr.append(new)
+        y_train_n.append(y_train[i])
+        i+=1
+    print(len(X_tr), len(y_train_n))
+
+    
+    X_te=[]
+    y_test_n=[]
+    test_scores2=[]
+    i =0
+    for item in X_test:
+        new = str(item)
+        X_te.append(new)
+        y_test_n.append(y_test[i])
+        ind_t=indxs[i]
+        score=test_scores[ind_t]
+        test_scores2.append(score)
+        i+=1
+    print(len(X_te), len(y_test_n))    
+
+    X_va=[]
+    y_val_n=[]
+    i =0
+    for item in X_val:
+        new = str(item)
+        X_va.append(new)
+        y_val_n.append(y_val[i])
+        i+=1
+
+    traind = pd.DataFrame()
+    traind['Label'] = y_train_n
+    traind['Text'] = X_tr
+    train_df = traind[['Text', 'Label']]
+    train_df.columns = ['text', 'label']
+
+    testd = pd.DataFrame()
+    testd['Label'] = y_test_n
+    testd['Text'] = X_te
+    test_df1 = testd[['Text', 'Label']]
+    test_df1.columns = ['text', 'label']
+
+    vald = pd.DataFrame()
+    vald['Label'] = y_val_n
+    vald['Text'] = X_va
+    dev_df = vald[['Text', 'Label']]
+    dev_df.columns = ['text', 'label']
+
+    train_df.shape, test_df1.shape, dev_df.shape#, test_df2.shape
+    print(test_scores2)
+    return train_df, test_df1, dev_df, test_scores2
+
+
+
+from datasets import Dataset
+
+def encode_labels(record):
+    return {"label": [record[feature] for feature in classes]}
+
+
+def shape_data(train_df, test_df1, dev_df, multi_label):
+    print(type(train_df))
+    print(train_df['label'].to_list())
+
+    from datasets import Dataset
+
+    train_ds = Dataset.from_dict(train_df)
+    dev_ds = Dataset.from_dict(dev_df)
+    test_ds1 = Dataset.from_dict(test_df1)
+
+    
+    if multi_label:
+        train_ds = train_ds.map(encode_labels)
+        test_ds1 = test_ds1.map(encode_labels)
+
+    train_ds
+    test_df = test_df1
+    test_ds = test_ds1
+
+    return train_ds, test_ds, dev_ds, test_df
+
+
+def set_model():
+    # Load a SetFit model from Hub 
+    pretrained_model_name = 'TurkuNLP/bert-base-finnish-cased-v1' 
+    if multi_label:
+        model = SetFitModel.from_pretrained(pretrained_model_name, multi_target_strategy="multi-output")
+    else:
+        model = SetFitModel.from_pretrained(pretrained_model_name)
+    return model, pretrained_model_name
+
+
+def config_wandb(action_n, multi_label, pretrained_model_name):
+    config = {'learning_rate': 3.0191843531454982e-05, 'num_epochs': 4, 'batch_size': 16, 'seed': 34, 'num_iterations': 6}
+
+    wandb.init(
+        entity="crisis-narratives",
+      project="Finnish-few-shot_SetFit",
+      notes="initial",
+      tags=["Henna", action_n, "binary", "single label" if multi_label else 'binary', action_n, 'multi label', 'cross-entropy', 'annotator3','annotator_based_individual_classifiers','best threshold', '1200_overlapping_set', pretrained_model_name],
+      config=config,
+    )
+    return wandb, config
+
+#!pip install wandb --upgrade
+def f1_score_weigted(y_true, y_pred):
+    return f1_score(y_true, y_pred, average='weighted')
+
+
+def train_model(model, train_ds, dev_ds, config):
+    trainer = SetFitTrainer(
+        model=model,
+        train_dataset=train_ds,
+        eval_dataset=dev_ds,
+        loss_class=CosineSimilarityLoss,
+        metric= f1_score_weigted,
+        **config,
+    )
+    # Push model to the Hub
+    # trainer.push_to_hub("my-setfit-model")
+    # Train and evaluate
+    trainer.train()
+    metric = trainer.evaluate()
+    metric
+    return model, metric, trainer
+
+def get_predictions(model, test_df, multi_label):    
+    # Run inference
+    preds = model.predict(test_df['text']).numpy()
+    preds.shape
+    probs = model.predict_proba(test_df['text']).numpy()
+    #probs = np.max(probs, axis=1)
+    probs.shape
+
+    if not multi_label:
+        # preds_labels = [classes[i] for i in preds]
+        y_true = test_df['label']
+        y_pred = preds
+    else:
+        y_true = test_df.drop(columns=['text']).values
+        y_pred = preds
+    y_true.shape, y_pred.shape
+    return preds, probs, y_true, y_pred
+
+
+def get_confusion_matrix(multi_label, wandb, y_true, y_pred, classes):
+    if not multi_label:
+        wandb.log({"confusion matrix" : wandb.plot.confusion_matrix(probs=None,
+                                y_true=y_true, preds=y_pred,
+                                class_names=classes)})
+
+        cm = confusion_matrix(y_true, y_pred)
+        df_cm = pd.DataFrame(cm, index = classes, columns = classes)
+        plt.figure(figsize = (10,7))
+        sns.heatmap(df_cm, annot=True)
+    else:
+        cm = multilabel_confusion_matrix(y_true, y_pred)
+
+        fig, ax = plt.subplots(5, 3, figsize=(12, 12))
+
+        for axes, cfs_matrix, label in zip(ax.flatten(), cm, classes):
+            print_confusion_matrix(cfs_matrix, axes, label, ["N", "Y"])
+
+        fig.tight_layout()
+        plt.show()   
+        wandb.log({"confusion matrix 2": wandb.Image(plt)})
+
+def get_classification_report(y_true, y_pred):
+    classes0 = ['False', 'True']
+    from sklearn.metrics import classification_report
+    print(classification_report(y_true, y_pred, target_names=classes0, zero_division=0))
+    with open('setfit_multilabel_annotator2_parallelset_classifreports.txt', 'a') as f:
+        lines = action_n
+        f.writelines(lines)
+        lines = str(classification_report(y_true, y_pred, target_names=classes0, zero_division=0))
+        f.writelines(lines)
+
+
+def get_evaluation_metrics(y_true, y_pred, wandb, probs, preds):
+    micro_f1_score = f1_score(y_true, y_pred, average='micro')
+    wandb.log({"f1-score micro": micro_f1_score})
+    print('f1-score micro', f1_score(y_true, y_pred, average='micro'))
+
+    macro_f1_score = f1_score(y_true, y_pred, average='macro')
+    wandb.log({"f1-score macro": macro_f1_score})
+    print('f1-score macro', macro_f1_score)
+
+    weighted_f1_score = f1_score(y_true, y_pred, average='weighted')
+    wandb.log({"f1-score weighted": weighted_f1_score})
+    print('f1-score weighted', weighted_f1_score)
+
+    #if not multi_label:
+    balanced_accuracy = balanced_accuracy_score(y_true, y_pred)
+    wandb.log({"balanced accuracy": balanced_accuracy})
+    print('balanced accuracy', balanced_accuracy)
+    #else:
+    accuracy = accuracy_score(y_true, y_pred)
+    wandb.log({"accuracy": accuracy})
+    print('accuracy ', accuracy)
+    
+    wandb.log({"prediction probabilities": probs})
+    wandb.log({"predictions": preds})
+    return balanced_accuracy, accuracy, macro_f1_score, micro_f1_score, weighted_f1_score
+
+def write_metrics_to_file(action_n, state_r, balanced_accuracy, accuracy, macro_f1_score, micro_f1_score, weighted_f1_score, ce_pq, ce_qp):
+    lines= ['New model results: ', str('threshold: ' +str(threshold) +' ,'), str(action_n), ' ,',str(state_r),' ,', 'multi label, averages',' ,', '1200 parallel set',' ,', 'balanced_accuracy:',' ,', str(balanced_accuracy),' ,', 'accuracy:',' ,', str(accuracy),' ,',
+       'macro-f1:',' ,', str(macro_f1_score),' ,', 'micro_f1_score:',' ,', str(micro_f1_score),' ,', 'weighted f1:', ' ,',str(weighted_f1_score),' ,', 'cross-entropy testp:',' ,',
+       str(ce_pq),' ,', 'cross-entropy ptest:', ' ,', str(ce_qp), '\n']
+
+    with open('setfit_multilabel_individual_annotator_based_classifier_annotator2_results.txt', 'a') as f:
+        f.writelines(lines)
+
+data = pd.read_csv('df_joined_1200.csv')
+data.head()
+
+value = float(0)
+data.fillna(value, inplace=True)
+
+multi_label = False
+
+classes = [0, 1]
+classes1 = ['informing statement',
+ 'challenge',
+ 'accusation',
+ 'rejection',
+ 'appreciation',
+ 'request',
+ 'question',
+ 'acceptance',
+ 'apology']
+num_classes = len(classes)
+
+random_states= [1,2,3,4,5,6,7,8,9,10] 
+
+data.to_csv("df_joined_1200_v2.csv", index=False)
+
+data = pd.read_csv('df_joined_1200_v2.csv')
+data.head()
+
+
+
+
+classes1 = ['statement']
+# 'question','rejection',
+# 'appreciation',
+#  'accusation',
+#  'challenge',
+ #'acceptance',
+ #apology, request]
+thresholds=[0,1,2] #,3,4,5,6
+
+k=0
+for action_n in classes1:
+    
+    threshold=thresholds[k]
+    print(action_n, threshold)
+    for state_x in random_states:
+                texts, labels, test_scs=get_data(data, action_n,threshold)
+                train_df, test_df1, dev_df, test_scores=get_data_splits(state_x, texts, labels, data, action_n, threshold, test_scs)
+
+                train_ds, test_ds, dev_ds, test_df= shape_data(train_df, test_df1, dev_df, multi_label)
+
+                model, pretrained_model_name = set_model()
+
+                wandb, config= config_wandb(action_n, multi_label, pretrained_model_name) 
+
+                model, metric, trainer= train_model(model, train_ds, dev_ds, config) 
+
+                preds, probs, y_true, y_pred= get_predictions(model, test_df, multi_label)
+
+                #get_confusion_matrix(multi_label, wandb, y_true, y_pred, classes)
+
+                get_classification_report(y_true, y_pred)
+
+                balanced_accuracy, accuracy, macro_f1_score, micro_f1_score, weighted_f1_score= get_evaluation_metrics(y_true, y_pred, wandb,probs, preds)
+
+                #ce_pq, ce_qp= get_cross_entropy_scores(test_scores, probs)
+
+                write_metrics_to_file(action_n, state_x, balanced_accuracy, accuracy, macro_f1_score, micro_f1_score, weighted_f1_score) #, ce_pq, ce_qp)
+                print(state_x)
+
+
+    k+=1
+
+
+
+#Demo
+
+preds = model(["Mie rakastin sitä Spider man leffaa!", "Ananas pitsas on kauheaa 🤮", "No siinähän meillä on todellinen jälkiviisauden mestari.", "Mitä sä oikein tarkotit tolla?"]) 
+if not multi_label:
+    print([classes[i] for i in preds])
+else:
+    print([[classes[index] for index, i in enumerate(pred) if i == 1 ] for pred in preds])
+
+
